@@ -31,6 +31,12 @@
    )
 )
 
+; lisp has return-from but it requires the name of the function we're in.
+; the best way to do this is to just keep track of the current function we're
+; parsing.
+; (car *clike-fn-stack*) is the current function
+(defvar *clike-fn-stack* nil)
+
 (declaim (ftype function clike-scope))
 (defun clike-expr (ts)
    (let (curr out)
@@ -52,8 +58,32 @@
                   (unless (listp next)
                      (error "`continue' must be invoked, it cannot be a bareword!"))
                   (if (> (length next) 1)
-                     (error "too many arguments to `continue` (provide at most 1)"))
+                     (error "too many arguments to `continue' (provide at most 1)"))
                   (setf out `(go ,(clike-while-tag-top (car next))))
+               )
+            ))
+            ((sym-is curr "RETURN") (progn
+               (if (null *clike-fn-stack*)
+                  (error "`return' used outside of a function!"))
+               ; we don't need to pop the current function name off of the
+               ; stack; that is the function parser's job. imagine this:
+               ;  function foo() {
+               ;     if (bar) { return(1) }
+               ;     else     { return(2) }
+               ;  }
+               ; by the time we get to the else block, we'd still want
+               ; (car *clike-fn-stack*) to be 'foo.
+               (let ((next (car! ts)))
+                  (unless (listp next)
+                     (error "`return' must be invoked, it cannot be a bareword!"))
+                  (let ((return-expr (clike-expr next)))
+                     (if (cdr return-expr)
+                        (error "`return' called with two expressions!"))
+                     (setf out
+                        `(return-from
+                           ,(car *clike-fn-stack*)
+                           ,(car (clike-expr next))))
+                  )
                )
             ))
             ((and ts (car ts) (listp (car ts))) (progn
@@ -92,7 +122,7 @@
 
                (loop
                   (if (null ts)
-                     (error "Expecting closing bracket list literal!~%"))
+                     (error "Expecting closing bracket list literal!"))
 
                   (if (sym-is (car ts) "]")
                      (return))
@@ -210,6 +240,25 @@
    )
 )
 
+(defun clike-function (ts)
+   (let ((name (car! ts)) (args (car! ts)) fbody-res fbody after-fn)
+      (setf *clike-fn-stack* (cons name *clike-fn-stack*))
+      (if (not (listp args))
+         (error "function ~A ???... expected a list there." name))
+
+      (token! (car! ts) "{")
+      (setf fbody-res (clike-scope ts))
+      (setf fbody (car fbody-res))
+      (setf ts (cdr fbody-res))
+      (token! (car! ts) "}")
+
+      (setf *clike-fn-stack* (cdr *clike-fn-stack*))
+
+      (setf after-fn (clike-scope ts))
+      (cons `(labels ((,name ,args ,fbody nil)) ,(car after-fn)) (cdr after-fn))
+   )
+)
+
 (defun clike-scope (ts)
    (let ((out `(progn)) res)
       (loop
@@ -235,6 +284,11 @@
                (psh! out (car res))
                (setf ts (cdr res))
             ))
+            ((sym-is (car ts) "FUNCTION") (progn
+               (setf res (clike-function (cdr ts)))
+               (psh! out (car res))
+               (setf ts (cdr res))
+            ))
             (t (progn
                (setf res (clike-expr ts))
                (psh! out (car res))
@@ -249,8 +303,9 @@
 (defmacro clike (&rest ts)
    (let ((res-scope (clike-scope ts)))
       (if (cdr res-scope)
-         (error "clike-toplevel: unexpected token `~F'~%" (caadr res-scope))
+         (error "clike-toplevel: unexpected token `~F'" (caadr res-scope))
          (car res-scope)
       )
    )
 )
+
